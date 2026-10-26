@@ -34,7 +34,7 @@ CACHE = ROOT / 'index_cache.json'
 LOCK = threading.Lock()
 STATUS = {'running': False, 'started': None, 'ended': None, 'results': {}}
 PORT = 8765
-APP_VERSION = '1.7.0'
+APP_VERSION = '1.7.3'
 TZ_DAY = lambda: datetime.now(ZoneInfo("Pacific/Auckland")).date()
 MONTHS = {m.lower(): i for i, m in enumerate(['','January','February','March','April','May','June','July','August','September','October','November','December']) if m}
 MONTHS.update({m[:3].lower(): v for m,v in list(MONTHS.items())})
@@ -62,7 +62,25 @@ NONLOCAL_CITIES = ('auckland', 'north shore', 'manukau', 'papakura',
                    'southland', 'northland', 'bay of plenty')
 NONLOCAL_RE = re.compile(r'(?<!\w)(?:' + '|'.join(re.escape(c) for c in NONLOCAL_CITIES) + r')(?!\w)', re.I)
 NONLOCAL_TITLE_SUFFIX_RE = re.compile(r'(?<!\w)(?:' + '|'.join(re.escape(c) for c in NONLOCAL_CITIES) + r')(?:\s*,?\s*(?:NZ|New Zealand))?\s*$', re.I)
-HEADERS = {'User-Agent':'Mozilla/5.0 (compatible; WellyOdditiesPersonalIndexer/1.0; +local-app)', 'Accept-Language':'en-NZ,en;q=0.9'}
+# Compare a conventional HTML request header set with the original identifiable
+# indexer headers. Never rotate identities or proxies; honour website restrictions.
+# Set WELLY_HTTP_PROFILE=indexer to reproduce the old behaviour for debugging.
+INDEXER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (compatible; WellyOdditiesPersonalIndexer/1.0; +local-app)',
+    'Accept-Language': 'en-NZ,en;q=0.9',
+}
+BROWSER_HEADERS = {
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                   'AppleWebKit/537.36 (KHTML, like Gecko) '
+                   'Chrome/140.0.0.0 Safari/537.36'),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-NZ,en;q=0.9',
+}
+def html_request_headers():
+    profile = os.environ.get('WELLY_HTTP_PROFILE', 'browser').strip().lower()
+    return (INDEXER_HEADERS if profile == 'indexer' else BROWSER_HEADERS).copy()
+
+HEADERS = html_request_headers()
 log = logging.getLogger('welly')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
@@ -269,8 +287,22 @@ def make_event(source,date,title,*,url=None,time='',venue='',price='',area='',on
 
 def request_soup(session,url):
     response=session.get(url,headers=HEADERS,timeout=14,allow_redirects=True)
+    code=getattr(response, 'status_code', 200)
+    if code >= 400:
+        # Log a useful diagnostic without storing response bodies or query tokens.
+        actual=urlparse(getattr(response, 'url', url))
+        headers=getattr(response, 'headers', {}) or {}
+        hops=len(getattr(response, 'history', []) or [])
+        server_hint='Cloudflare' if ('cf-ray' in headers or 'cf-mitigated' in headers) else 'unspecified server'
+        content_type=headers.get('Content-Type', '?').split(';')[0]
+        raise requests.HTTPError(
+            f'HTTP {code} from {actual.netloc}{actual.path[:80]} '
+            f'({hops} redirects; {server_hint}; type={content_type})', response=response)
     response.raise_for_status()
     if len(response.content)>4_000_000:raise ValueError('Page too large')
+    headers=getattr(response, 'headers', {}) or {}
+    if headers.get('cf-mitigated', '').lower() == 'challenge':
+        raise RuntimeError('Cloudflare challenge instead of event HTML')
     # Some sites return XML for feed URLs. Dedicated feed readers parse those as XML.
     return BeautifulSoup(response.content,'html.parser')
 
@@ -678,11 +710,19 @@ def _ef_total(payload, plural):
     obj = payload.get(plural, payload)
     if not isinstance(obj, dict):
         obj = payload
-    for field in ('count', 'total', 'total_count'):
-        try:
-            return int(obj[field])
-        except (KeyError, TypeError, ValueError):
+    # In Eventfinda collection responses `count` may be the number of
+    # records in *this page* (e.g. 10), not the total number of matches.
+    # Treat only an explicitly named total as the total; otherwise fetch
+    # until an empty page or until the repeated-page guard detects trouble.
+    for holder in (obj, payload.get('pagination', {}), payload.get('meta', {})):
+        if not isinstance(holder, dict):
             continue
+        for field in ('total', 'total_count', 'total_results'):
+            try:
+                value = int(holder[field])
+                return value if value >= 0 else None
+            except (KeyError, TypeError, ValueError):
+                continue
     return None
 
 
@@ -704,44 +744,47 @@ def _ef_api_get(session, resource, user, password, params):
 
 
 def _ef_location_id(session, user, password):
-    """Locate the Wellington *region*, including its child towns, by name.
+    """Look for the whole region before using Wellington city as a fallback.
 
-    The API's `location` filter expects a numeric location ID. We intentionally
-    do not guess one: if discovery fails, report it rather than importing NZ-wide
-    results and inaccurately labelling them Wellington.
+    The Eventfinda location search can return multiple Wellington-named places.
+    Earlier versions could select the city before finding the parent region.
     """
     override = os.environ.get('EVENTFINDA_LOCATION_ID', '').strip()
     if override:
         if not override.isdigit():
             raise ValueError('EVENTFINDA_LOCATION_ID must be numeric')
+        log.info('Eventfinda API location: explicit location ID %s', override)
         return override
-    # Search terms are supported by some v2 endpoints; when not supported,
-    # paginate a bounded set and match the region's exact name/slugs.
-    for page in range(6):
-        obj = _ef_api_get(session, 'locations', user, password,
-                          {'q': 'Wellington', 'rows': 100, 'offset': page * 100})
-        records = _ef_collection(obj, 'location', 'locations')
-        matches = []
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            name = normspace(record.get('name', '')) .lower()
-            slug = normspace(record.get('url_slug', '')).lower()
-            if name in ('wellington region', 'wellington') or slug in ('wellington-region', 'wellington'):
-                matches.append(record)
-        # Prefer Wellington Region to Wellington City; the former covers Hutt,
-        # Porirua, Kāpiti and Wairarapa.
-        matches.sort(key=lambda r: 0 if 'region' in normspace(r.get('name', '')).lower() or
-                            'region' in normspace(r.get('url_slug', '')).lower() else 1)
-        for record in matches:
-            ident = record.get('id')
-            if ident is not None and str(ident).isdigit():
-                return str(ident)
-        total = _ef_total(obj, 'locations')
-        if not records or len(records) < 100 or (total is not None and (page + 1) * 100 >= total):
-            break
-    raise ValueError('Wellington region ID not found in Eventfinda locations API. '
-                     'Set EVENTFINDA_LOCATION_ID using the numeric ID from its API.')
+    city_candidate = None
+    for search in ('Wellington Region', 'Wellington'):
+        for page in range(6):
+            obj = _ef_api_get(session, 'locations', user, password,
+                              {'q': search, 'rows': 100, 'offset': page * 100})
+            records = _ef_collection(obj, 'location', 'locations')
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                ident = str(record.get('id', ''))
+                if not ident.isdigit():
+                    continue
+                name = normspace(record.get('name', '')).lower()
+                slug = normspace(record.get('url_slug', '')).lower()
+                if name == 'wellington region' or slug == 'wellington-region':
+                    log.info('Eventfinda API location: Wellington Region (ID %s)', ident)
+                    return ident
+                if name in ('wellington city', 'wellington') or slug in ('wellington-city', 'wellington'):
+                    city_candidate = (ident, normspace(record.get('name', 'Wellington')))
+            total = _ef_total(obj, 'locations')
+            if not records or len(records) < 100 or (total is not None and (page + 1) * 100 >= total):
+                break
+    if city_candidate:
+        ident, name = city_candidate
+        log.warning('Eventfinda API: Wellington *region* ID not found; falling back to %s (ID %s). '
+                    'This can exclude Hutt, Porirua, Kāpiti and Wairarapa. '
+                    'Set EVENTFINDA_LOCATION_ID to the region ID.', name, ident)
+        return ident
+    raise ValueError('Wellington location ID not found in Eventfinda locations API. '
+                     'Set EVENTFINDA_LOCATION_ID to the numeric Wellington Region ID.')
 
 
 def _ef_text(v):
@@ -828,22 +871,62 @@ def scrape_eventfinda_api(session, src):
     if not user or not password:
         raise ValueError('Eventfinda API credentials are not configured')
     location_id = _ef_location_id(session, user, password)
+    # Explicit date bounds avoid relying on the API's implicit/default window.
+    # The app only displays events up to 300 days ahead (see good_date).
+    start_date = TZ_DAY()
+    end_date = start_date + timedelta(days=300)
+    common = {'location': location_id, 'rows': 100,
+              'start_date': start_date.isoformat(), 'end_date': end_date.isoformat()}
     results = []
     pages = 0
-    for offset in range(0, 1000, 100):
-        data = _ef_api_get(session, 'events', user, password,
-                           {'location': location_id, 'rows': 100, 'offset': offset})
+    offset = 0
+    total = None
+    seen_pages = set()
+    # A free-tier request may return only 10 records despite rows=100.
+    # Allow enough pages for several hundred unique listings. Raise rather
+    # than silently claim completeness if this safety cap is exhausted.
+    max_pages = 60
+    for _ in range(max_pages):
+        data = _ef_api_get(session, 'events', user, password, dict(common, offset=offset))
         rows = _ef_collection(data, 'event', 'events')
-        results.extend(rows)
         pages += 1
-        total = _ef_total(data, 'events')
-        if not rows or len(rows) < 100 or (total is not None and offset + len(rows) >= total):
+        reported = _ef_total(data, 'events')
+        if reported is not None:
+            total = reported
+        page_count = (data.get('events', {}) if isinstance(data, dict) else {})
+        page_count = page_count.get('count') if isinstance(page_count, dict) else None
+        log.info('Eventfinda API page %d: offset=%d, returned=%d, page count=%s, explicit total=%s',
+                 pages, offset, len(rows), str(page_count) if page_count is not None else '?',
+                 str(total) if total is not None else '?')
+        if not rows:
             break
+        # Do not assume the service honours rows=100. It may cap each page
+        # to a smaller size; advancing by 100 skips records in that case.
+        fingerprint = (str(rows[0].get('id', '')) if isinstance(rows[0],dict) else str(rows[0]),
+                       str(rows[-1].get('id', '')) if isinstance(rows[-1],dict) else str(rows[-1]))
+        if fingerprint in seen_pages:
+            raise ValueError('Eventfinda API repeats a page (offset appears to be ignored)')
+        seen_pages.add(fingerprint)
+        results.extend(rows)
+        offset += len(rows)
+        if total is not None and offset >= total:
+            break
+    else:
+        raise ValueError(f'Eventfinda API exceeded {max_pages} pages; increase the page cap to cover the full catalogue')
     if not results:
-        raise ValueError('Eventfinda API responded but contained no events')
+        raise ValueError('Eventfinda API responded but contained no event records')
     events = parse_eventfinda_api({'events': results}, src)
-    log.info('Eventfinda API: %d page(s), %d event records, %d valid Wellington dates',
-             pages, len(results), len(events))
+    # Diagnostics distinguish incomplete retrieval from date/venue parsing.
+    with_date = sum(bool(_ef_day_and_time(row, row)[0]) for row in results if isinstance(row, dict))
+    unknown = sum(e['area'] == 'Unknown' for e in events)
+    first = min((e['date'] for e in events), default='none')
+    last = max((e['date'] for e in events), default='none')
+    log.info('Eventfinda API: location ID %s, range %s to %s, %d page(s), '
+             '%d raw records, API reported total=%s, %d records with top-level dates, '
+             '%d retained event dates (%d unknown locations), from %s to %s',
+             location_id, start_date.isoformat(), end_date.isoformat(),
+             pages, len(results), str(total) if total is not None else '?',
+             with_date, len(events), unknown, first, last)
     if not events:
         raise ValueError('Eventfinda API returned records but no usable upcoming Wellington dates')
     return events
@@ -1064,6 +1147,7 @@ DATA=load_cache()
 def run_refresh(source_ids):
     global DATA
     ids=set(source_ids)
+    log.info('HTML request profile: %s', 'indexer' if HEADERS == INDEXER_HEADERS else 'browser')
     candidates=[s for s in SOURCES if s['id'] in ids]
     outcome={}
     def worker(src):

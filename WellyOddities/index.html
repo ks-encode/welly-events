@@ -45,7 +45,7 @@ main{min-width:0;max-width:1470px;width:100%;margin:0 auto;padding:35px clamp(19
 'use strict';
 const ICONS={Engineering:'⚙',Science:'✦',Heritage:'◇',Outdoors:'♧',Workshops:'✂',Arts:'◈',Music:'♫',Social:'☻',Community:'◉',General:'▦'};
 const CATEGORIES=['Engineering','Science','Heritage','Outdoors','Workshops','Arts','Music','Social','Community'];
-const APP_VERSION='1.7.0';
+const APP_VERSION='1.7.3';
 const seed=JSON.parse(document.getElementById('initial-data').textContent);
 const $=id=>document.getElementById(id);
 const todayParts=()=>{const p=new Intl.DateTimeFormat('en-NZ',{year:'numeric',month:'2-digit',day:'2-digit',timeZone:'Pacific/Auckland'}).formatToParts(new Date());const obj=Object.fromEntries(p.map(x=>[x.type,x.value]));return `${obj.year}-${obj.month}-${obj.day}`;};

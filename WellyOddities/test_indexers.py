@@ -10,6 +10,34 @@ class Session:
     def __init__(self,pages):self.pages=pages
     def get(self,url,**kw):return Resp(self.pages.get(url,'<html><body></body></html>'))
 
+class RequestHeaderTests(unittest.TestCase):
+    def test_browser_profile_and_indexer_profile(self):
+        import os
+        with patch.dict(os.environ, {'WELLY_HTTP_PROFILE': 'browser'}):
+            h=server.html_request_headers()
+            self.assertIn('Mozilla/5.0', h['User-Agent'])
+            self.assertIn('text/html', h['Accept'])
+        with patch.dict(os.environ, {'WELLY_HTTP_PROFILE': 'indexer'}):
+            h=server.html_request_headers()
+            self.assertIn('WellyOdditiesPersonalIndexer', h['User-Agent'])
+
+    def test_http_failure_reports_final_host_and_cloudflare(self):
+        class Forbidden:
+            status_code=403
+            content=b'forbidden'
+            url='https://events.humanitix.com/blocked?private=secret'
+            history=[object()]
+            headers={'cf-ray':'abc123', 'Content-Type':'text/html; charset=utf-8'}
+        class DeniedSession:
+            def get(self,*args,**kwargs):return Forbidden()
+        with self.assertRaises(server.requests.HTTPError) as err:
+            server.request_soup(DeniedSession(),'https://humanitix.com/nz/events')
+        message=str(err.exception)
+        self.assertIn('403',message)
+        self.assertIn('Cloudflare',message)
+        self.assertIn('redirects',message)
+        self.assertNotIn('secret',message)
+
 class ParserTests(unittest.TestCase):
     def setUp(self):
         # Fixtures are set in October 2026; keep tests stable on future dates.
@@ -253,6 +281,81 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(events[0]['title'],'Brass Band Night')
         self.assertEqual(events[0]['date'],'2026-10-24')
 
+    def test_eventfinda_api_short_pages_continue_and_date_window(self):
+        """A 61-row page is not necessarily the end of a 200-row result."""
+        from datetime import date
+        src=next(x for x in server.SOURCES if x['id']=='eventfinda')
+        class ApiResponse:
+            content=b'{}'
+            def __init__(self,data):self.data=data
+            def json(self):return self.data
+            def raise_for_status(self):pass
+        class ApiSession:
+            def __init__(self):self.offsets=[]
+            def get(self,url,**kwargs):
+                q=kwargs.get('params',{})
+                if url.endswith('locations.json'):
+                    return ApiResponse({'locations':{'location':[{'name':'Wellington Region','id':77}], 'count':1}})
+                off=q['offset'];self.offsets.append(off)
+                self_outer.assertEqual(q['start_date'],'2026-10-13')
+                self_outer.assertEqual(q['end_date'],'2027-08-09')
+                data=[{'id':i,'name':f'Interesting Event {i}',
+                       'url':f'https://www.eventfinda.co.nz/2026/test-{i}/wellington',
+                       'datetime_start':'2026-11-02T12:30:00+13:00',
+                       'location':{'name':'Wellington'}} for i in range(off,min(off+61,200))]
+                return ApiResponse({'events':{'count':200, 'event':data}})
+        self_outer=self
+        sess=ApiSession()
+        with patch.dict('os.environ',{'EVENTFINDA_USERNAME':'test','EVENTFINDA_PASSWORD':'test','EVENTFINDA_LOCATION_ID':''}):
+            found=server.scrape_eventfinda_api(sess,src)
+        self.assertEqual(sess.offsets,[0,61,122,183,200])
+        self.assertEqual(len(found),200)
+
+    def test_eventfinda_count_is_page_size_not_total(self):
+        # Realistic small free-tier page sizes: the old code incorrectly
+        # interpreted 'count':10 as a full-result total and stopped at page 1.
+        src=next(x for x in server.SOURCES if x['id']=='eventfinda')
+        class ApiResponse:
+            content=b'{}'
+            def __init__(self, data): self.data=data
+            def json(self): return self.data
+            def raise_for_status(self): pass
+        class ApiSession:
+            def __init__(self): self.offsets=[]
+            def get(self, url, **kwargs):
+                q=kwargs['params']
+                if url.endswith('locations.json'):
+                    return ApiResponse({'locations':{'location':[{'name':'Wellington Region','id':77}], 'count':1}})
+                off=q['offset']; self.offsets.append(off)
+                rows=[{'id':i, 'name':f'Wellington event {i}',
+                       'url':f'https://www.eventfinda.co.nz/2026/example-{i}/wellington',
+                       'datetime_start':'2026-11-05T17:30:00+13:00',
+                       'location':{'name':'Wellington'}}
+                      for i in range(off, min(off+10, 37))]
+                return ApiResponse({'events':{'count':len(rows), 'event':rows}})
+        sess=ApiSession()
+        with patch.dict('os.environ', {'EVENTFINDA_USERNAME':'test', 'EVENTFINDA_PASSWORD':'test',
+                                      'EVENTFINDA_LOCATION_ID':''}):
+            got=server.scrape_eventfinda_api(sess,src)
+        self.assertEqual(sess.offsets, [0,10,20,30,37])
+        self.assertEqual(len(got),37)
+
+    def test_eventfinda_prefers_region_to_city(self):
+        class ApiResponse:
+            content=b'{}'
+            def __init__(self,data):self.data=data
+            def json(self):return self.data
+            def raise_for_status(self):pass
+        class ApiSession:
+            def get(self,url,**kwargs):
+                q=kwargs['params']
+                locations=[{'name':'Wellington','id':44}]
+                if q['q']=='Wellington':
+                    locations.append({'name':'Wellington Region','id':77})
+                return ApiResponse({'locations':{'location':locations,'count':len(locations)}})
+        with patch.dict('os.environ', {'EVENTFINDA_LOCATION_ID':''}):
+            self.assertEqual(server._ef_location_id(ApiSession(),'user','pass'),'77')
+
     def test_eventfinda_api_nested_response_and_location_safety(self):
         src=next(x for x in server.SOURCES if x['id']=='eventfinda')
         payload={'events':{'count':3,'event':[
@@ -292,6 +395,8 @@ class ParserTests(unittest.TestCase):
                         {'id':88,'name':'Wellington City','url_slug':'wellington-city'},
                         {'id':77,'name':'Wellington Region','url_slug':'wellington-region'}], 'count':2}})
                 if url.endswith('events.json'):
+                    if kwargs.get('params', {}).get('offset', 0) > 0:
+                        return ApiResponse({'events':{'event':[], 'count':0}})
                     return ApiResponse({'events':{'event':[
                         {'id':15,'name':'Microscope Workshop','datetime_start':'2026-11-04T11:00:00+13:00',
                          'url':'https://www.eventfinda.co.nz/2026/microscope-workshop/wellington',
