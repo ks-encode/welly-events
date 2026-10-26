@@ -44,6 +44,10 @@ jobs:
           restore-keys: |
             welly-oddities-index-
       - name: Refresh the public source index
+        env:
+          EVENTFINDA_USERNAME: ${{ secrets.EVENTFINDA_USERNAME }}
+          EVENTFINDA_PASSWORD: ${{ secrets.EVENTFINDA_PASSWORD }}
+          EVENTFINDA_LOCATION_ID: ${{ vars.EVENTFINDA_LOCATION_ID }}
         run: python WellyOddities/refresh_for_web.py
       - name: Build public site and event feed
         run: python WellyOddities/build_public.py
