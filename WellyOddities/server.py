@@ -7,6 +7,7 @@ No external API key. Sites may restrict scraping or change markup; success is re
 from __future__ import annotations
 import ast
 import hashlib
+import xml.etree.ElementTree as ET
 import json
 import logging
 import re
@@ -14,6 +15,7 @@ import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -31,8 +33,8 @@ CACHE = ROOT / 'index_cache.json'
 LOCK = threading.Lock()
 STATUS = {'running': False, 'started': None, 'ended': None, 'results': {}}
 PORT = 8765
-APP_VERSION = '1.3.0'
-TZ_DAY = lambda: datetime.now().date()  # host local date; event dates use calendar dates
+APP_VERSION = '1.6.0'
+TZ_DAY = lambda: datetime.now(ZoneInfo("Pacific/Auckland")).date()
 MONTHS = {m.lower(): i for i, m in enumerate(['','January','February','March','April','May','June','July','August','September','October','November','December']) if m}
 MONTHS.update({m[:3].lower(): v for m,v in list(MONTHS.items())})
 DATE_RE = re.compile(r'(?<!\d)(\d{1,2})(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+(20\d{2}))?', re.I)
@@ -41,12 +43,12 @@ ISO_RE = re.compile(r'20\d\d-\d\d-\d\d')
 # The feed is WELLINGTON ONLY. National event sources regularly include events
 # in other cities, even when their listing URL appears to be Wellington-filtered.
 LOCAL_AREAS = {'Wellington', 'Lower Hutt', 'Upper Hutt', 'Porirua', 'Kāpiti', 'Wairarapa'}
-NATIONAL_SOURCES = {'eventfinda', 'humanitix', 'meetup', 'eventbrite', 'allevents', 'facebook', 'whatsfree'}
+NATIONAL_SOURCES = {'eventfinda', 'humanitix', 'meetup', 'eventbrite', 'allevents', 'whatsfree', 'natlib'}
 # These organisers publish substantially local listings; venue-less entries can
 # be accepted, but an explicit out-of-region venue still overrides this hint.
 LOCAL_SOURCES = {'glean', 'pyramid', 'bats', 'fringebar', 'heritage', 'hutt',
                  'upper', 'kapiti', 'porirua', 'wellingtonnz', 'museums',
-                 'vuw', 'rsonz', 'was', 'tepapa', 'natlib', 'wcl', 'zealandia',
+                 'vuw', 'rsonz', 'was', 'tepapa', 'wcl', 'zealandia',
                  'fringe', 'performance', 'artclub', 'wtmc', 'utr', 'image',
                  'engineering'}
 NONLOCAL_CITIES = ('auckland', 'north shore', 'manukau', 'papakura',
@@ -158,12 +160,12 @@ def area_from(text):
     t=(text or '').lower()
     if NONLOCAL_RE.search(t): return 'Outside region'
     if 'online' in t or 'webinar' in t or 'zoom' in t: return 'Online'
-    if any(x in t for x in ['lower hutt','petone','eastbourne','wainuiomata']): return 'Lower Hutt'
-    if any(x in t for x in ['upper hutt','trentham','silverstream','pinehaven']): return 'Upper Hutt'
-    if 'porirua' in t or 'pātaka' in t: return 'Porirua'
+    if any(x in t for x in ['lower hutt','petone','eastbourne','wainuiomata','hutt central','naenae','taita','stokes valley']): return 'Lower Hutt'
+    if any(x in t for x in ['upper hutt','trentham','silverstream','pinehaven','ebdentown']): return 'Upper Hutt'
+    if 'porirua' in t or 'pātaka' in t or 'tītahi bay' in t or 'titahi bay' in t or 'plimmerton' in t: return 'Porirua'
     if any(x in t for x in ['kāpiti','kapiti','waikanae','paraparaumu','paekākāriki','raumati','otaki','ōtaki']): return 'Kāpiti'
     if any(x in t for x in ['wairarapa','martinborough','featherston','greytown','masterton']): return 'Wairarapa'
-    if any(x in t for x in ['wellington','pōneke','te aro','newtown','kelburn','karori','thorndon','miramar','johnsonville','newlands']): return 'Wellington'
+    if any(x in t for x in ['wellington','pōneke','te aro','newtown','kelburn','karori','thorndon','miramar','johnsonville','newlands','hutt central','tawa','brooklyn','island bay','kilbirnie','mount cook','mount victoria','thorndon','mt victoria','mt cook','wadestown','hataitai']): return 'Wellington'
     return ''
 
 
@@ -195,7 +197,7 @@ def location_for_event(source, title, venue='', area='', online=False, url=''):
     if source in LOCAL_SOURCES:
         return {'hutt':'Lower Hutt','upper':'Upper Hutt','kapiti':'Kāpiti',
                 'porirua':'Porirua'}.get(source,'Wellington')
-    return None
+    return 'Unknown'
 
 
 def local_record(e):
@@ -268,6 +270,7 @@ def request_soup(session,url):
     response=session.get(url,headers=HEADERS,timeout=14,allow_redirects=True)
     response.raise_for_status()
     if len(response.content)>4_000_000:raise ValueError('Page too large')
+    # Some sites return XML for feed URLs. Dedicated feed readers parse those as XML.
     return BeautifulSoup(response.content,'html.parser')
 
 def scrape_glean(session,src):
@@ -513,6 +516,241 @@ def scrape_fringebar(session,src):
     return unique_events(out)
 
 
+# Humanitix's main Wellington landing page currently exposes only FOUR featured
+# event cards in server-rendered HTML. Category "trending" pages expose many more.
+# These are public listing URLs, not Humanitix's organiser-only private API.
+HUMANITIX_CATEGORIES = (
+    'trending--businessandprofessional',
+    'trending--healthandwellness',
+    'trending--music',
+)
+HUMANITIX_CARD_PLACES = (
+    'Wellington Central', 'Mount Victoria', 'Mount Cook', 'Oriental Bay',
+    'Hutt Central', 'Lower Hutt', 'Upper Hutt', 'Wellington',
+    'Porirua', 'Petone', 'Newtown', 'Te Aro', 'Kelburn', 'Thorndon',
+    'Brooklyn', 'Karori', 'Island Bay', 'Johnsonville', 'Miramar',
+    'Tawa', 'Pipitea', 'Kilbirnie', 'Roseneath', 'Khandallah',
+    'Newlands', 'Elsdon', 'Woburn', 'Days Bay', 'Wainuiomata',
+    'Waikanae', 'Paraparaumu', 'Paekākāriki', 'Featherston',
+    'Greytown', 'Masterton', 'Hamilton Central', 'Auckland Central',
+    'Christchurch Central', 'To be announced', 'Online',
+)
+
+
+def humanitix_card_event(src, raw, url):
+    """Read dated, labelled cards from the marketplace's public HTML."""
+    raw=normspace(raw)
+    m=DATE_RE.search(raw)
+    if not m:return None
+    date=parse_date(m.group())
+    if not date:return None
+    # Cards can start with follower counts and weekday. Capture only after date.
+    title=raw[m.end():].lstrip(' ,–-')
+    # Drop the time and optional 'more times' badge preceding the event title.
+    title=re.sub(r'^(?:\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b)\s*', '', title,flags=re.I)
+    title=re.sub(r'^\+\d+\s+more\s+times?\s*', '',title,flags=re.I)
+    if not title or title==raw:return None
+    venue=''
+    for loc in sorted(HUMANITIX_CARD_PLACES,key=len,reverse=True):
+        if re.search(r'(?<!\w)'+re.escape(loc)+r'\s*$',title,re.I):
+            title=re.sub(r'(?<!\w)'+re.escape(loc)+r'\s*$', '',title,flags=re.I).strip(' ,-')
+            if loc.lower()!='to be announced':venue=loc
+            break
+    if len(title)<5:return None
+    return make_event(src['id'],date,title,url=url,time=parse_time(raw),
+                      venue=venue,online=(venue.lower()=='online'))
+
+
+def scrape_humanitix(session, src):
+    """Collect public Wellington category listings, not just four featured cards.
+
+    The homepage only exposes a small 'Trending' carousel in its HTML. Additional
+    public category pages typically expose dozens of dated anchors and may have
+    a 'Next' pagination link. These are browsed separately and deduplicated by
+    canonical event URL/date; detail JSON-LD enriches the card when available.
+    """
+    base=src['url'].rstrip('/')
+    listing_urls=[base]+[base+'/'+p for p in HUMANITIX_CATEGORIES]
+    queue=list(listing_urls)
+    visited=set()
+    items={}  # (detail url, event day) -> best known event
+    detail_links=[]
+    successful=0
+    failures=[]
+
+    def canonical(u):
+        p=urlparse(u)
+        return (p.scheme+'://'+p.netloc.lower()+p.path.rstrip('/')).lower()
+
+    def retain(event):
+        if not event:return
+        k=(canonical(event['url']),event['date'])
+        old=items.get(k)
+        if old is None:
+            items[k]=event
+        else:
+            # A detail page has a complete name, venue and perhaps description.
+            richness=lambda e:(bool(e.get('venue')), bool(e.get('description')),len(e.get('venue','')))
+            if richness(event)>richness(old):items[k]=event
+
+    while queue and len(visited)<10:
+        page=queue.pop(0)
+        if page in visited:continue
+        visited.add(page)
+        try:
+            soup=request_soup(session,page)
+        except Exception as exc:
+            failures.append(f'{page.split("/")[-1]}: {exc}')
+            continue
+        successful+=1
+        for a in soup.find_all('a',href=True):
+            url=urljoin(page,a['href']).split('#',1)[0]
+            parsed=urlparse(url)
+            if parsed.netloc.lower() in ('events.humanitix.com','www.events.humanitix.com') and parsed.path.strip('/'):
+                # Query parameters often contain tracking; keep a canonical URL.
+                url=parsed.scheme+'://'+parsed.netloc+parsed.path.rstrip('/')
+                if url not in detail_links:detail_links.append(url)
+                raw=normspace(a.get_text(' ',strip=True))
+                if not DATE_RE.search(raw):
+                    for ancestor in (a.parent, a.parent.parent if a.parent else None):
+                        if ancestor is None:continue
+                        candidate=normspace(ancestor.get_text(' ',strip=True))
+                        if len(candidate)<400 and DATE_RE.search(candidate):
+                            raw=candidate;break
+                retain(humanitix_card_event(src,raw,url))
+            # Follow explicit next-page links, but never wander to other cities.
+            elif (parsed.netloc.lower() in ('humanitix.com','www.humanitix.com')
+                  and parsed.path.rstrip('/') == urlparse(page).path.rstrip('/')
+                  and parsed.query and re.search(r'\b(?:next|page\s*\d+)\b',a.get_text(' ',strip=True),re.I)
+                  and url not in visited and url not in queue):
+                queue.append(url)
+
+    if not successful:
+        raise RuntimeError('All Humanitix listing pages failed: '+('; '.join(failures)[:300]))
+
+    # Detail JSON-LD is more reliable for venue, cost and multi-day metadata.
+    # Cap requests so a single provider doesn't monopolise the refresh cycle.
+    for url in detail_links[:30]:
+        try:
+            detail=request_soup(session,url)
+            parsed=parse_jsonld(detail,src,url)
+            if not parsed:
+                parsed=parse_detail_dates(detail,src,url)
+            for e in parsed:retain(e)
+        except Exception:continue
+
+    if failures:
+        log.warning('Humanitix: %d of %d listing pages failed; showing partial index: %s',
+                    len(failures),successful+len(failures),'; '.join(failures)[:200])
+    log.info('Humanitix: %d listing pages checked, %d event links, %d dated events',
+             successful,len(detail_links),len(items))
+    return unique_events(list(items.values()))
+
+
+def scrape_eventfinda(session, src):
+    """Parse public regional event cards/details; flag HTTP 403 instead of pretending success.
+
+    The listing site may deny automated traffic. No private API or key is assumed.
+    """
+    url=src['url'];soup=request_soup(session,url)
+    out=parse_jsonld(soup,src,url)
+    links=[];seen=set()
+    for a in soup.find_all('a',href=True):
+        href=urljoin(url,a['href']); parsed=urlparse(href)
+        if not parsed.netloc.lower().endswith('eventfinda.co.nz'):continue
+        if not re.search(r'^/20\d\d/[^/]+/(?:wellington(?:-[^/]+)?|lower-hutt|upper-hutt|porirua|kapiti|wairarapa)',parsed.path,re.I):continue
+        if href in seen:continue
+        seen.add(href);links.append(href)
+        text=normspace(a.get_text(' ',strip=True))
+        ctx=text
+        for parent in (a.parent,a.parent.parent if a.parent else None):
+            if parent:
+                t=normspace(parent.get_text(' ',strip=True))
+                if 15<len(t)<700 and DATE_RE.search(t):ctx=t;break
+        date=parse_date(ctx)
+        if date and len(text)>=5:
+            ev=make_event(src['id'],date,text,url=href,time=parse_time(ctx),area=area_from(parsed.path.replace('-',' ')))
+            if ev:out.append(ev)
+    # Limit network requests: preserve availability of the entire refresh job.
+    for href in links[:20]:
+        try:
+            detail=request_soup(session,href)
+            found=parse_jsonld(detail,src,href)
+            if found:out+=found
+            elif not any(e['url']==href for e in out):out+=parse_detail_dates(detail,src,href)
+        except Exception:continue
+    return unique_events(out)
+
+
+def scrape_upper(session,src):
+    """Council's dated anchor cards, including events linking to library websites."""
+    soup=request_soup(session,src['url']);out=[];seen=set()
+    for a in soup.find_all('a',href=True):
+        raw=normspace(a.get_text(' ',strip=True))
+        m=DATE_RE.search(raw)
+        if not m or len(raw)>850:continue
+        date=parse_date(m.group(0));title=raw[:m.start()].strip(' -–')
+        if not title or len(title)<5 or len(title)>170:continue
+        key=(date,title)
+        if key in seen:continue
+        seen.add(key)
+        # Location is already trustworthy because this is the city council's local calendar.
+        ev=make_event(src['id'],date,title,area='Upper Hutt',url=urljoin(src['url'],a['href']),time=parse_time(raw[m.end():m.end()+80]))
+        if ev:out.append(ev)
+    return unique_events(out)
+
+
+def scrape_natlib(session,src):
+    """Extract individual dated event listings from National Library calendar cards."""
+    soup=request_soup(session,src['url']);out=[]
+    out.extend(parse_jsonld(soup,src,src['url']))
+    for a in soup.select('a[href]'):
+        href=urljoin(src['url'],a['href']);path=urlparse(href).path
+        if not re.search(r'^/events/20\d\d/\d{1,2}/\d{1,2}(?:/|$)',path):continue
+        title=normspace(a.get_text(' ',strip=True))
+        if not 5<=len(title)<=170:continue
+        date_match=re.search(r'/events/(20\d\d)/(\d\d?)/(\d\d?)',path)
+        date=f'{date_match.group(1)}-{int(date_match.group(2)):02}-{int(date_match.group(3)):02}'
+        context=normspace(a.parent.get_text(' ',strip=True)) if a.parent else ''
+        ev=make_event(src['id'],date,title,url=href,venue='',time=parse_time(context),online=bool(re.search(r'\bonline\b',context,re.I)))
+        if ev:out.append(ev)
+    # If the site uses event cards without date URLs, use nearby explicit display date.
+    if not out:out+=parse_cards(soup,src,src['url'])
+    return unique_events(out)
+
+
+def scrape_wcl(session,src):
+    """Wellington City Libraries publishes a public Trumba RSS xCal event feed."""
+    base='https://www.trumba.com/calendars/wellington-city-libraries.rss'
+    now=TZ_DAY().strftime('%Y%m%d')
+    response=session.get(base,params={'startdate':now,'weeks':12,'previousweeks':0,'xcal':1},headers=HEADERS,timeout=18)
+    response.raise_for_status()
+    root=ET.fromstring(response.content)
+    out=[]
+    def tag_text(node, ending):
+        for item in node.iter():
+            if item.tag.rsplit('}',1)[-1].lower()==ending.lower():
+                value=normspace(' '.join(item.itertext()))
+                if value:return value
+        return ''
+    for item in root.iter():
+        if item.tag.rsplit('}',1)[-1].lower()!='item':continue
+        title=tag_text(item,'title');link=tag_text(item,'link')
+        # Never use rss pubDate: it is the publishing date, not event time.
+        start=tag_text(item,'dtstart') or tag_text(item,'startdate') or tag_text(item,'start')
+        if not start:
+            description=BeautifulSoup(tag_text(item,'description'),'html.parser').get_text(' ',strip=True)
+            m=re.search(r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*[,]?\s+\d{1,2}\s+[A-Za-z]+\s+20\d\d',description,re.I)
+            start=m.group(0) if m else ''
+        date=parse_date(start)
+        if not date:continue
+        venue=tag_text(item,'location') or tag_text(item,'where')
+        ev=make_event(src['id'],date,title,url=link or src['url'],venue=venue or 'Wellington City Libraries',time=parse_time(start))
+        if ev:out.append(ev)
+    if not out:raise ValueError('No dated events found in Trumba RSS; feed layout may have changed')
+    return unique_events(out)
+
+
 def scrape_generic(session,src):
     """Best-effort publicly available JSON-LD event discovery. No fabricated dates."""
     out=[];url=src['url'];soup=request_soup(session,url)
@@ -602,14 +840,14 @@ def load_cache():
                     num=sum(e['source']==sid for e in cached['events'])
                     cached.setdefault('source_status',{})[sid]={'state':'snapshot' if num else 'not indexed','count':num}
             before=len(cached.get('events',[]))
-            cached['events']=unique_events([safe for e in cached.get('events',[]) if (safe:=local_record(e)) is not None])
+            cached['events']=unique_events([safe for e in cached.get('events',[]) if e.get('source') in {x['id'] for x in SOURCES} and (safe:=local_record(e)) is not None])
             removed=before-len(cached['events'])
             if removed: log.info('Excluded %d cached out-of-region or unverified-location events',removed)
             for sid,st in cached.get('source_status',{}).items():
                 st['count']=sum(e['source']==sid for e in cached['events'])
             return cached
         except Exception:pass
-    seed_events=unique_events([safe for e in SEED['events'] if (safe:=local_record(e)) is not None])
+    seed_events=unique_events([safe for e in SEED['events'] if e.get('source') in {x['id'] for x in SOURCES} and (safe:=local_record(e)) is not None])
     return dict(updated=SEED['updated'],events=seed_events,source_status={s['id']:{'state':'snapshot' if any(e['source']==s['id'] for e in seed_events) else 'not indexed','count':sum(e['source']==s['id'] for e in seed_events)} for s in SOURCES})
 
 DATA=load_cache()
@@ -626,6 +864,11 @@ def run_refresh(source_ids):
             elif src['id']=='heritage':ev=scrape_heritage(session,src)
             elif src['id']=='hutt':ev=scrape_hutt(session,src)
             elif src['id']=='fringebar':ev=scrape_fringebar(session,src)
+            elif src['id']=='humanitix':ev=scrape_humanitix(session,src)
+            elif src['id']=='eventfinda':ev=scrape_eventfinda(session,src)
+            elif src['id']=='upper':ev=scrape_upper(session,src)
+            elif src['id']=='natlib':ev=scrape_natlib(session,src)
+            elif src['id']=='wcl':ev=scrape_wcl(session,src)
             else:ev=scrape_generic(session,src)
             return unique_events(ev)
     with ThreadPoolExecutor(max_workers=5) as pool:
@@ -634,7 +877,7 @@ def run_refresh(source_ids):
             source=futuremap[f]
             try:
                 events=f.result();state='indexed' if events else 'no readable events'
-                outcome[source['id']]=dict(state=state,count=len(events),events=events,checked=datetime.now().isoformat(timespec='minutes'))
+                outcome[source['id']]=dict(state=state,count=len(events),unknown=sum(e.get('area')=='Unknown' for e in events),events=events,checked=datetime.now().isoformat(timespec='minutes'))
             except Exception as ex:
                 log.warning('Failed %s: %s',source['id'],ex)
                 outcome[source['id']]=dict(state='failed',count=0,error=str(ex)[:130],checked=datetime.now().isoformat(timespec='minutes'))
@@ -653,6 +896,7 @@ def run_refresh(source_ids):
         DATA=dict(updated=datetime.now().isoformat(timespec='minutes'),events=unique_events(safe),source_status=current_status)
         for sid,st in DATA['source_status'].items():
             st['count']=sum(e['source']==sid for e in DATA['events'])
+            st['unknown']=sum(e['source']==sid and e.get('area')=='Unknown' for e in DATA['events'])
         temp=CACHE.with_suffix('.tmp')
         temp.write_text(json.dumps(DATA,ensure_ascii=False,indent=2),encoding='utf-8');temp.replace(CACHE)
         STATUS.update(running=False,ended=datetime.now().isoformat(timespec='minutes'),results={sid:{k:v for k,v in x.items() if k!='events'} for sid,x in outcome.items()})
