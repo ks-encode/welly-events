@@ -340,6 +340,73 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(sess.offsets, [0,10,20,30,37])
         self.assertEqual(len(got),37)
 
+    def test_eventfinda_page_budget_saves_partial_and_resumes(self):
+        """Page cap must NOT discard all events; next run resumes at saved offset."""
+        src=next(x for x in server.SOURCES if x['id']=='eventfinda')
+        class Resp:
+            content=b'{}'
+            def __init__(self, data):self.data=data
+            def raise_for_status(self):pass
+            def json(self):return self.data
+        class ApiSession:
+            def __init__(self):self.offsets=[]
+            def get(self,url,**kw):
+                if url.endswith('locations.json'):
+                    return Resp({'locations':{'location':[{'name':'Wellington Region','id':11}]}})
+                off=kw['params']['offset'];self.offsets.append(off)
+                rows=[{'id':i,'name':f'Workshop number {i}',
+                       'url':f'https://www.eventfinda.co.nz/2026/ww{i}/wellington',
+                       'datetime_start':'2026-11-04T18:00:00+13:00',
+                       'location':{'name':'Wellington'}}
+                      for i in range(off,min(off+10,47))]
+                return Resp({'events':{'event':rows,'count':len(rows)}})
+        sess=ApiSession()
+        old=server.DATA
+        try:
+            # Partial run indexes 30 records, even without the final empty page.
+            server.DATA={'events':[],'source_status':{}}
+            with patch.dict('os.environ', {'EVENTFINDA_USERNAME':'test',
+                    'EVENTFINDA_PASSWORD':'test','EVENTFINDA_LOCATION_ID':'11',
+                    'WELLY_EVENTFINDA_PAGES_PER_RUN':'3'}):
+                first=server.scrape_eventfinda_api(sess,src)
+            self.assertFalse(first.complete)
+            self.assertEqual(first.next_offset,30)
+            self.assertEqual(len(first),30)
+            self.assertEqual(sess.offsets,[0,10,20])
+            server.DATA={'events':list(first), 'source_status':{'eventfinda':{'state':'partial','next_offset':30}}}
+            sess2=ApiSession()
+            with patch.dict('os.environ', {'EVENTFINDA_USERNAME':'test',
+                    'EVENTFINDA_PASSWORD':'test','EVENTFINDA_LOCATION_ID':'11',
+                    'WELLY_EVENTFINDA_PAGES_PER_RUN':'3'}):
+                last=server.scrape_eventfinda_api(sess2,src)
+            self.assertTrue(last.complete)
+            self.assertTrue(last.continued)
+            self.assertEqual(last.next_offset,0)
+            self.assertEqual(len(last),17)
+            self.assertEqual(sess2.offsets,[30,40,47])
+        finally:
+            server.DATA=old
+
+    def test_partial_refresh_keeps_previous_eventfinda_entries(self):
+        import tempfile
+        from pathlib import Path
+        old_data=server.DATA;old_cache=server.CACHE
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                server.CACHE=Path(td)/'index_cache.json'
+                older=server.make_event('eventfinda','2026-11-02','Older Wellington Workshop',venue='Wellington')
+                newer=server.make_event('eventfinda','2026-11-03','Newer Wellington Workshop',venue='Wellington')
+                server.DATA={'events':[older],'source_status':{'eventfinda':{'state':'partial','next_offset':20}},'updated':''}
+                with patch('server.scrape_eventfinda_best',return_value=server.EventfindaBatch(
+                        [newer],complete=False,next_offset=30,continued=True)):
+                    server.run_refresh(['eventfinda'])
+                self.assertEqual(server.DATA['source_status']['eventfinda']['state'],'partial')
+                self.assertEqual(server.DATA['source_status']['eventfinda']['next_offset'],30)
+                self.assertEqual(sum(e['source']=='eventfinda' for e in server.DATA['events']),2)
+                self.assertTrue(server.CACHE.exists())
+            finally:
+                server.DATA=old_data;server.CACHE=old_cache
+
     def test_eventfinda_prefers_region_to_city(self):
         class ApiResponse:
             content=b'{}'

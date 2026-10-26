@@ -34,7 +34,7 @@ CACHE = ROOT / 'index_cache.json'
 LOCK = threading.Lock()
 STATUS = {'running': False, 'started': None, 'ended': None, 'results': {}}
 PORT = 8765
-APP_VERSION = '1.7.3'
+APP_VERSION = '1.7.4'
 TZ_DAY = lambda: datetime.now(ZoneInfo("Pacific/Auckland")).date()
 MONTHS = {m.lower(): i for i, m in enumerate(['','January','February','March','April','May','June','July','August','September','October','November','December']) if m}
 MONTHS.update({m[:3].lower(): v for m,v in list(MONTHS.items())})
@@ -865,27 +865,50 @@ def parse_eventfinda_api(payload, src):
     return unique_events(out)
 
 
+class EventfindaBatch(list):
+    """Events with pagination progress, kept separate from the public event JSON.
+
+    A capped API fetch is a PARTIAL SUCCESS, not a scrape failure.
+    """
+    def __init__(self, events, *, complete, next_offset, continued):
+        super().__init__(events)
+        self.complete = complete
+        self.next_offset = next_offset
+        self.continued = continued
+
+
 def scrape_eventfinda_api(session, src):
     user = os.environ.get('EVENTFINDA_USERNAME', '').strip()
     password = os.environ.get('EVENTFINDA_PASSWORD', '')
     if not user or not password:
         raise ValueError('Eventfinda API credentials are not configured')
     location_id = _ef_location_id(session, user, password)
-    # Explicit date bounds avoid relying on the API's implicit/default window.
-    # The app only displays events up to 300 days ahead (see good_date).
+    # Keep the original 300-day search horizon used by the calendar.
     start_date = TZ_DAY()
     end_date = start_date + timedelta(days=300)
     common = {'location': location_id, 'rows': 100,
               'start_date': start_date.isoformat(), 'end_date': end_date.isoformat()}
+    # The free tier has been observed returning 6-10 results per request even
+    # with rows=100. Continue from the saved offset across refreshes.
+    previous = DATA.get('source_status', {}).get(src['id'], {})
+    try:
+        saved_offset = int(previous.get('next_offset', 0) or 0)
+    except (ValueError, TypeError):
+        saved_offset = 0
+    # An offset is valid only when there is cached data from earlier pages.
+    continued = saved_offset > 0 and any(e.get('source') == src['id'] for e in DATA.get('events', []))
+    offset = saved_offset if continued else 0
+    try:
+        # Bounded to avoid accidental unbounded traffic/API quotas; operators
+        # may set 1..300 per run based on their account's permitted limits.
+        max_pages = max(1, min(300, int(os.environ.get('WELLY_EVENTFINDA_PAGES_PER_RUN', '90'))))
+    except ValueError:
+        max_pages = 90
     results = []
     pages = 0
-    offset = 0
     total = None
     seen_pages = set()
-    # A free-tier request may return only 10 records despite rows=100.
-    # Allow enough pages for several hundred unique listings. Raise rather
-    # than silently claim completeness if this safety cap is exhausted.
-    max_pages = 60
+    complete = False
     for _ in range(max_pages):
         data = _ef_api_get(session, 'events', user, password, dict(common, offset=offset))
         rows = _ef_collection(data, 'event', 'events')
@@ -893,43 +916,43 @@ def scrape_eventfinda_api(session, src):
         reported = _ef_total(data, 'events')
         if reported is not None:
             total = reported
-        page_count = (data.get('events', {}) if isinstance(data, dict) else {})
-        page_count = page_count.get('count') if isinstance(page_count, dict) else None
+        page_container = data.get('events', {}) if isinstance(data, dict) else {}
+        page_count = page_container.get('count') if isinstance(page_container, dict) else None
         log.info('Eventfinda API page %d: offset=%d, returned=%d, page count=%s, explicit total=%s',
                  pages, offset, len(rows), str(page_count) if page_count is not None else '?',
                  str(total) if total is not None else '?')
         if not rows:
+            complete = True
             break
-        # Do not assume the service honours rows=100. It may cap each page
-        # to a smaller size; advancing by 100 skips records in that case.
-        fingerprint = (str(rows[0].get('id', '')) if isinstance(rows[0],dict) else str(rows[0]),
-                       str(rows[-1].get('id', '')) if isinstance(rows[-1],dict) else str(rows[-1]))
+        fingerprint = (str(rows[0].get('id', '')) if isinstance(rows[0], dict) else str(rows[0]),
+                       str(rows[-1].get('id', '')) if isinstance(rows[-1], dict) else str(rows[-1]))
         if fingerprint in seen_pages:
-            raise ValueError('Eventfinda API repeats a page (offset appears to be ignored)')
+            # Unlike a page cap, repeated pages cannot be trusted as useful
+            # forward progress; don't advance a cursor using suspect data.
+            raise ValueError('Eventfinda API repeated a page; offset may be ignored')
         seen_pages.add(fingerprint)
         results.extend(rows)
         offset += len(rows)
         if total is not None and offset >= total:
+            complete = True
             break
-    else:
-        raise ValueError(f'Eventfinda API exceeded {max_pages} pages; increase the page cap to cover the full catalogue')
-    if not results:
+    if not results and not complete:
         raise ValueError('Eventfinda API responded but contained no event records')
     events = parse_eventfinda_api({'events': results}, src)
-    # Diagnostics distinguish incomplete retrieval from date/venue parsing.
     with_date = sum(bool(_ef_day_and_time(row, row)[0]) for row in results if isinstance(row, dict))
     unknown = sum(e['area'] == 'Unknown' for e in events)
-    first = min((e['date'] for e in events), default='none')
-    last = max((e['date'] for e in events), default='none')
-    log.info('Eventfinda API: location ID %s, range %s to %s, %d page(s), '
-             '%d raw records, API reported total=%s, %d records with top-level dates, '
-             '%d retained event dates (%d unknown locations), from %s to %s',
-             location_id, start_date.isoformat(), end_date.isoformat(),
-             pages, len(results), str(total) if total is not None else '?',
-             with_date, len(events), unknown, first, last)
-    if not events:
+    log.info('Eventfinda API: location ID %s, %s to %s, %d pages, %d raw records, '
+             '%d records with top-level dates, %d retained dated entries, complete=%s, next_offset=%d',
+             location_id, start_date, end_date, pages, len(results), with_date,
+             len(events), complete, 0 if complete else offset)
+    if not complete:
+        log.warning('Eventfinda catalogue PARTIAL: saved %d API records from this run; '
+                    'continuing from offset %d on next refresh (page budget %d)',
+                    len(results), offset, max_pages)
+    if not events and results:
         raise ValueError('Eventfinda API returned records but no usable upcoming Wellington dates')
-    return events
+    return EventfindaBatch(events, complete=complete,
+                          next_offset=0 if complete else offset, continued=continued)
 
 
 def scrape_eventfinda_best(session, src):
@@ -1163,23 +1186,35 @@ def run_refresh(source_ids):
             elif src['id']=='natlib':ev=scrape_natlib(session,src)
             elif src['id']=='wcl':ev=scrape_wcl(session,src)
             else:ev=scrape_generic(session,src)
-            return unique_events(ev)
+            meta = {}
+            if isinstance(ev, EventfindaBatch):
+                meta = {'state': 'indexed' if ev.complete else 'partial',
+                        'next_offset': ev.next_offset,
+                        'merge_previous': ev.continued or not ev.complete}
+            return unique_events(ev), meta
     with ThreadPoolExecutor(max_workers=5) as pool:
         futuremap={pool.submit(worker,src):src for src in candidates}
         for f in as_completed(futuremap):
             source=futuremap[f]
             try:
-                events=f.result();state='indexed' if events else 'no readable events'
-                outcome[source['id']]=dict(state=state,count=len(events),unknown=sum(e.get('area')=='Unknown' for e in events),events=events,checked=datetime.now().isoformat(timespec='minutes'))
+                events,meta=f.result()
+                state=meta.get('state', 'indexed' if events else 'no readable events')
+                outcome[source['id']]=dict(state=state,count=len(events),
+                    unknown=sum(e.get('area')=='Unknown' for e in events),events=events,
+                    checked=datetime.now().isoformat(timespec='minutes'),
+                    **{k:v for k,v in meta.items() if k!='state'})
             except Exception as ex:
                 log.warning('Failed %s: %s',source['id'],ex)
                 outcome[source['id']]=dict(state='failed',count=0,error=str(ex)[:130],checked=datetime.now().isoformat(timespec='minutes'))
     with LOCK:
         old=DATA['events']
-        finished={sid for sid,x in outcome.items() if x['state']=='indexed'}
-        # Replace a source's previous events only when new events were actually readable.
-        final=[e for e in old if e['source'] not in finished]
-        for sid in finished:final+=outcome[sid]['events']
+        updated_ids={sid for sid,x in outcome.items() if x['state'] in ('indexed','partial')}
+        # A partial Eventfinda batch is merged with previously indexed pages.
+        # A completed first-page-to-last-page scrape replaces old data; a
+        # completed continuation preserves the earlier pages from its cache.
+        replace_ids={sid for sid in updated_ids if not outcome[sid].get('merge_previous')}
+        final=[e for e in old if e['source'] not in replace_ids and good_date(e.get('date',''))]
+        for sid in updated_ids:final+=outcome[sid]['events']
         current_status=dict(DATA.get('source_status',{}))
         for sid,x in outcome.items():
             current_status[sid]={k:v for k,v in x.items() if k!='events'}

@@ -45,7 +45,7 @@ main{min-width:0;max-width:1470px;width:100%;margin:0 auto;padding:35px clamp(19
 'use strict';
 const ICONS={Engineering:'⚙',Science:'✦',Heritage:'◇',Outdoors:'♧',Workshops:'✂',Arts:'◈',Music:'♫',Social:'☻',Community:'◉',General:'▦'};
 const CATEGORIES=['Engineering','Science','Heritage','Outdoors','Workshops','Arts','Music','Social','Community'];
-const APP_VERSION='1.7.3';
+const APP_VERSION='1.7.4';
 const seed=JSON.parse(document.getElementById('initial-data').textContent);
 const $=id=>document.getElementById(id);
 const todayParts=()=>{const p=new Intl.DateTimeFormat('en-NZ',{year:'numeric',month:'2-digit',day:'2-digit',timeZone:'Pacific/Auckland'}).formatToParts(new Date());const obj=Object.fromEntries(p.map(x=>[x.type,x.value]));return `${obj.year}-${obj.month}-${obj.day}`;};
@@ -94,7 +94,7 @@ function getEvents({savedOnly=false,excludeFilters=false}={}){
 }
 function formatFullDate(iso){return `${fmtDay(iso)} ${Number(iso.slice(8))} ${fmtMonth(iso)} ${iso.slice(0,4)}`;}
 function sourceState(id){return data.source_status?.[id]?.state||'not indexed';}
-function sourceClass(id){const a=sourceState(id);return a==='indexed'?'indexed':a==='snapshot'?'snapshot':a==='failed'?'failed':a==='no readable events'?'empty':'';}
+function sourceClass(id){const a=sourceState(id);return a==='indexed'?'indexed':a==='partial'?'snapshot':a==='snapshot'?'snapshot':a==='failed'?'failed':a==='no readable events'?'empty':'';}
 function statusLabel(id){const st=data.source_status?.[id];return st?.state||'not indexed';}
 function renderRail(){const counts=countsBySource();$('railcats').innerHTML=CATEGORIES.map(cat=>`<label class="filterline ${state.cats.size>0&&!state.cats.has(cat)?'off':''}"><input type="checkbox" data-cat="${cat}" ${state.cats.has(cat)?'checked':''}><span>${ICONS[cat]} &nbsp; ${cat}</span><em>${data.events.filter(e=>e.type===cat&&e.date>=today).length}</em></label>`).join('');
  $('railsites').innerHTML=data.sources.map(s=>`<div class="site-row" title="${esc(statusLabel(s.id))}"><input type="checkbox" id="src-${esc(s.id)}" data-site="${esc(s.id)}" ${state.off.has(s.id)?'':'checked'}><label for="src-${esc(s.id)}">${esc(s.name)}</label><span class="statusdot ${sourceClass(s.id)}"></span><small>${counts[s.id]||'–'}</small></div>`).join('');
@@ -117,7 +117,7 @@ function groupHtml(list){if(!list.length)return `<div class="empty"><i>◌</i><h
 function renderAgenda(){const list=getEvents();const shown=list.slice(0,state.maxShown);$('agenda').innerHTML=groupHtml(shown);$('resultstext').innerHTML=`<strong>${list.length}</strong> events matching your filters · <strong>${data.sources.length-state.off.size}</strong> websites enabled`;
  $('showmore').classList.toggle('hidden',list.length<=state.maxShown);
  $('hero-count').textContent=data.events.filter(e=>e.date>=today).length;
- $('hero-period').textContent=`${data.sources.filter(s=>['indexed','snapshot'].includes(sourceState(s.id))).length} sources with data`;
+ $('hero-period').textContent=`${data.sources.filter(s=>['indexed','partial','snapshot'].includes(sourceState(s.id))).length} sources with data`;
  const ready=data.updated?.slice(0,10)||'2026-10-13';const live=state.hasServer;
  $('data-note').innerHTML=live?`<b>${data.app_version===APP_VERSION?'Local indexer v'+APP_VERSION+' connected.':'⚠ Indexer version mismatch: '+(data.app_version||'older version')+' — stop the old server and start this updated version.'}</b> Latest stored update: ${esc(ready)}. Press Refresh to check enabled public sources. Results may be incomplete; each source has a status.`:`<b>Offline snapshot.</b> ${data.events.length} date-stamped entries checked 13 October 2026. For live event updates, use the included Python server. No website can be assumed fully indexed.`;
  $('scanstatus').textContent=state.refreshing?'Checking websites…':'';
@@ -125,7 +125,7 @@ function renderAgenda(){const list=getEvents();const shown=list.slice(0,state.ma
  $('refreshbtn').textContent=state.refreshing?'◌ Updating…':'↻  Refresh events';
 }
 function renderSaved(){const ids=state.saved;const list=data.events.filter(e=>ids.has(e.id)).sort((a,b)=>a.date.localeCompare(b.date));$('savedagenda').innerHTML=groupHtml(list);}
-function renderSources(){const count=countsBySource();$('sourcelist').innerHTML=data.sources.map(s=>{const st=data.source_status?.[s.id]||{};return `<div class="source-card"><div class="srhead"><h3>${esc(s.name)}</h3><label><input type="checkbox" data-site="${esc(s.id)}" ${state.off.has(s.id)?'':'checked'}> Include</label></div><p>${esc(s.description)}</p><div class="srfoot"><span class="state ${sourceClass(s.id)}">${esc(statusLabel(s.id))}</span><span>${count[s.id]||0} upcoming${st.unknown?' · '+st.unknown+' unconfirmed location':''} · <a href="${esc(safeUrl(s.url))}" target="_blank" rel="noopener noreferrer">Visit ↗</a></span></div>${st.error?`<div class="srerror">Last error: ${esc(st.error)}</div>`:''}${st.checked?`<div class="srchecked">Checked: ${esc(st.checked.replace('T',' '))}</div>`:''}</div>`;}).join('');}
+function renderSources(){const count=countsBySource();$('sourcelist').innerHTML=data.sources.map(s=>{const st=data.source_status?.[s.id]||{};return `<div class="source-card"><div class="srhead"><h3>${esc(s.name)}</h3><label><input type="checkbox" data-site="${esc(s.id)}" ${state.off.has(s.id)?'':'checked'}> Include</label></div><p>${esc(s.description)}</p><div class="srfoot"><span class="state ${sourceClass(s.id)}">${esc(statusLabel(s.id))}</span><span>${count[s.id]||0} upcoming${st.unknown?' · '+st.unknown+' unconfirmed location':''} · <a href="${esc(safeUrl(s.url))}" target="_blank" rel="noopener noreferrer">Visit ↗</a></span></div>${st.state==='partial'?`<div class="srchecked">Partial index · next batch starts at API offset ${st.next_offset||0}</div>`:''}${st.error?`<div class="srerror">Last error: ${esc(st.error)}</div>`:''}${st.checked?`<div class="srchecked">Checked: ${esc(st.checked.replace('T',' '))}</div>`:''}</div>`;}).join('');}
 function render(){savePrefs();renderRail();renderCats();renderAgenda();renderSaved();renderSources();['agenda','saved','sources'].forEach(pg=>$('view-'+pg).classList.toggle('hidden',state.page!==pg));}
 function setPage(pg){state.page=pg;state.maxShown=60;document.querySelector('#rail').classList.remove('open');$('overlay').classList.remove('open');render();window.scrollTo({top:300,behavior:'smooth'});}
 function escapeIcs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/\r?\n/g,'\\n').replace(/,/g,'\\,').replace(/;/g,'\\;');}
