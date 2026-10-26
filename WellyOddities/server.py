@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import time
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -684,6 +685,13 @@ def scrape_humanitix(session, src):
 # supplied by GitHub Secrets, never bundled with public assets or cached events.
 EVENTFINDA_API = 'https://api.eventfinda.co.nz/v2'
 
+# API rate-limiting diagnostic: Eventfinda documents a maximum of one request
+# per second. Keep consecutive request STARTS >= 1.5 seconds apart.
+# (Do not increase the 18-second timeout here: we want to isolate the cause.)
+EF_REQUEST_LOCK = threading.Lock()
+EF_LAST_REQUEST_START = [0.0]
+
+
 
 def _ef_collection(payload, singular, plural):
     """V2 responses vary between flat and nested XML-to-JSON forms."""
@@ -727,11 +735,43 @@ def _ef_total(payload, plural):
 
 
 def _ef_api_get(session, resource, user, password, params):
+    """Perform an Eventfinda request with compliant pacing and timing logs.
+
+    The normal production read timeout remains 18 seconds. These diagnostics
+    show whether the provider slows or rejects specific offsets, without
+    exposing credentials, request URL, or response bodies in Actions logs.
+    """
     url = EVENTFINDA_API + '/' + resource + '.json'
-    # Never log user, password, Basic authorization header or full response.
-    response = session.get(url, params=params, auth=(user, password),
-                           headers={'Accept': 'application/json', 'User-Agent': HEADERS['User-Agent']},
-                           timeout=18, allow_redirects=False)
+    try:
+        min_gap = float(os.environ.get('WELLY_EVENTFINDA_MIN_INTERVAL', '1.5'))
+    except ValueError:
+        min_gap = 1.5
+    min_gap = max(1.1, min(min_gap, 10.0))  # Eventfinda maximum 1 request/second
+    with EF_REQUEST_LOCK:
+        wait = max(0.0, EF_LAST_REQUEST_START[0] + min_gap - time.monotonic())
+        if wait:
+            time.sleep(wait)
+        EF_LAST_REQUEST_START[0] = time.monotonic()
+    started = time.monotonic()
+    try:
+        response = session.get(
+            url, params=params, auth=(user, password),
+            headers={'Accept': 'application/json', 'User-Agent': HEADERS['User-Agent']},
+            timeout=18, allow_redirects=False)
+    except requests.exceptions.RequestException as exc:
+        log.warning('Eventfinda API transport error: resource=%s offset=%s '
+                    'elapsed=%.2fs error_type=%s', resource,
+                    params.get('offset', 'lookup'), time.monotonic() - started,
+                    type(exc).__name__)
+        raise
+    elapsed = time.monotonic() - started
+    h = response.headers
+    # Only disclose a small whitelist of diagnostic response headers.
+    log.info('Eventfinda API HTTP: resource=%s offset=%s status=%s elapsed=%.2fs '
+             'bytes=%d retry-after=%s rate-limit-remaining=%s',
+             resource, params.get('offset', 'lookup'), response.status_code, elapsed,
+             len(response.content), h.get('Retry-After', '-'),
+             h.get('X-RateLimit-Remaining', '-'))
     response.raise_for_status()
     if len(response.content) > 4_000_000:
         raise ValueError('Eventfinda API response too large')
