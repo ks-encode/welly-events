@@ -2,7 +2,7 @@
 
 Run: python server.py
 Requires: requests, beautifulsoup4 (pip install -r requirements.txt)
-No external API key. Sites may restrict scraping or change markup; success is reported per source.
+Eventfinda API credentials are read only from environment variables; never embed them in files.
 """
 from __future__ import annotations
 import ast
@@ -10,6 +10,7 @@ import hashlib
 import xml.etree.ElementTree as ET
 import json
 import logging
+import os
 import re
 import threading
 import webbrowser
@@ -33,7 +34,7 @@ CACHE = ROOT / 'index_cache.json'
 LOCK = threading.Lock()
 STATUS = {'running': False, 'started': None, 'ended': None, 'results': {}}
 PORT = 8765
-APP_VERSION = '1.6.0'
+APP_VERSION = '1.7.0'
 TZ_DAY = lambda: datetime.now(ZoneInfo("Pacific/Auckland")).date()
 MONTHS = {m.lower(): i for i, m in enumerate(['','January','February','March','April','May','June','July','August','September','October','November','December']) if m}
 MONTHS.update({m[:3].lower(): v for m,v in list(MONTHS.items())})
@@ -647,6 +648,214 @@ def scrape_humanitix(session, src):
     return unique_events(list(items.values()))
 
 
+# Eventfinda Developer API v2 uses HTTP Basic authentication. Credentials are
+# supplied by GitHub Secrets, never bundled with public assets or cached events.
+EVENTFINDA_API = 'https://api.eventfinda.co.nz/v2'
+
+
+def _ef_collection(payload, singular, plural):
+    """V2 responses vary between flat and nested XML-to-JSON forms."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    container = payload.get(plural, payload)
+    if isinstance(container, list):
+        return container
+    if isinstance(container, dict):
+        values = container.get(singular, container.get(plural, []))
+        if isinstance(values, dict):
+            return [values]
+        if isinstance(values, list):
+            return values
+    values = payload.get(singular, [])
+    return values if isinstance(values, list) else ([values] if isinstance(values, dict) else [])
+
+
+def _ef_total(payload, plural):
+    if not isinstance(payload, dict):
+        return None
+    obj = payload.get(plural, payload)
+    if not isinstance(obj, dict):
+        obj = payload
+    for field in ('count', 'total', 'total_count'):
+        try:
+            return int(obj[field])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _ef_api_get(session, resource, user, password, params):
+    url = EVENTFINDA_API + '/' + resource + '.json'
+    # Never log user, password, Basic authorization header or full response.
+    response = session.get(url, params=params, auth=(user, password),
+                           headers={'Accept': 'application/json', 'User-Agent': HEADERS['User-Agent']},
+                           timeout=18, allow_redirects=False)
+    response.raise_for_status()
+    if len(response.content) > 4_000_000:
+        raise ValueError('Eventfinda API response too large')
+    data = response.json()
+    if not isinstance(data, (dict, list)):
+        raise ValueError('Unexpected Eventfinda API response structure')
+    if isinstance(data, dict) and (data.get('error') or data.get('errors')):
+        raise ValueError('Eventfinda API returned an error response (check access tier and parameters)')
+    return data
+
+
+def _ef_location_id(session, user, password):
+    """Locate the Wellington *region*, including its child towns, by name.
+
+    The API's `location` filter expects a numeric location ID. We intentionally
+    do not guess one: if discovery fails, report it rather than importing NZ-wide
+    results and inaccurately labelling them Wellington.
+    """
+    override = os.environ.get('EVENTFINDA_LOCATION_ID', '').strip()
+    if override:
+        if not override.isdigit():
+            raise ValueError('EVENTFINDA_LOCATION_ID must be numeric')
+        return override
+    # Search terms are supported by some v2 endpoints; when not supported,
+    # paginate a bounded set and match the region's exact name/slugs.
+    for page in range(6):
+        obj = _ef_api_get(session, 'locations', user, password,
+                          {'q': 'Wellington', 'rows': 100, 'offset': page * 100})
+        records = _ef_collection(obj, 'location', 'locations')
+        matches = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            name = normspace(record.get('name', '')) .lower()
+            slug = normspace(record.get('url_slug', '')).lower()
+            if name in ('wellington region', 'wellington') or slug in ('wellington-region', 'wellington'):
+                matches.append(record)
+        # Prefer Wellington Region to Wellington City; the former covers Hutt,
+        # Porirua, Kāpiti and Wairarapa.
+        matches.sort(key=lambda r: 0 if 'region' in normspace(r.get('name', '')).lower() or
+                            'region' in normspace(r.get('url_slug', '')).lower() else 1)
+        for record in matches:
+            ident = record.get('id')
+            if ident is not None and str(ident).isdigit():
+                return str(ident)
+        total = _ef_total(obj, 'locations')
+        if not records or len(records) < 100 or (total is not None and (page + 1) * 100 >= total):
+            break
+    raise ValueError('Wellington region ID not found in Eventfinda locations API. '
+                     'Set EVENTFINDA_LOCATION_ID using the numeric ID from its API.')
+
+
+def _ef_text(v):
+    if isinstance(v, dict):
+        return normspace(v.get('name') or v.get('text') or v.get('value') or '')
+    return normspace(v)
+
+
+def _ef_venue(row):
+    loc = row.get('location') or row.get('venue') or {}
+    parts = []
+    if isinstance(loc, dict):
+        for field in ('name', 'address', 'city', 'region'):
+            value = _ef_text(loc.get(field, ''))
+            if value and value.lower() not in [p.lower() for p in parts]:
+                parts.append(value)
+    elif isinstance(loc, str):
+        parts.append(loc)
+    for field in ('venue_name', 'venue_address'):
+        value = _ef_text(row.get(field, ''))
+        if value and value.lower() not in [p.lower() for p in parts]:
+            parts.append(value)
+    return ', '.join(parts)
+
+
+def _ef_occurrences(row):
+    """Yield dated sessions or the overall event date if no sessions supplied."""
+    sess = row.get('sessions', row.get('session', []))
+    if isinstance(sess, dict):
+        sess = _ef_collection({'sessions': sess}, 'session', 'sessions')
+    if isinstance(sess, list) and sess:
+        for item in sess[:120]:
+            if isinstance(item, dict):
+                yield item
+        return
+    yield row
+
+
+def _ef_day_and_time(item, event):
+    for obj in (item, event):
+        for field in ('datetime_start', 'start_datetime', 'startDate', 'start_date', 'date'):
+            value = obj.get(field, '')
+            if isinstance(value, dict):
+                value = value.get('datetime') or value.get('date') or value.get('value') or ''
+            value = str(value or '')
+            parsed = parse_date(value)
+            if parsed:
+                hhmm = re.search(r'T(\d\d:\d\d)', value)
+                return parsed, (hhmm.group(1) if hhmm else parse_time(value))
+    return '', ''
+
+
+def parse_eventfinda_api(payload, src):
+    """Convert API records to the calendar schema; explicit non-Wellington
+    venues are rejected by make_event, unknown locations remain optional."""
+    out = []
+    for row in _ef_collection(payload, 'event', 'events'):
+        if not isinstance(row, dict):
+            continue
+        title = _ef_text(row.get('name') or row.get('title') or '')
+        if not title:
+            continue
+        url = _ef_text(row.get('url') or row.get('event_url') or src['url'])
+        if not url.startswith('https://www.eventfinda.co.nz/'):
+            url = src['url']
+        venue = _ef_venue(row)
+        price = _ef_text(row.get('price') or row.get('ticket_price') or '')
+        if row.get('is_free') is True:
+            price = 'Free'
+        description = _ef_text(row.get('description') or row.get('short_description') or '')
+        for item in _ef_occurrences(row):
+            date, time = _ef_day_and_time(item, row)
+            if date:
+                event = make_event(src['id'], date, title, url=url, time=time,
+                                   venue=venue, price=price, description=description)
+                if event:
+                    out.append(event)
+    return unique_events(out)
+
+
+def scrape_eventfinda_api(session, src):
+    user = os.environ.get('EVENTFINDA_USERNAME', '').strip()
+    password = os.environ.get('EVENTFINDA_PASSWORD', '')
+    if not user or not password:
+        raise ValueError('Eventfinda API credentials are not configured')
+    location_id = _ef_location_id(session, user, password)
+    results = []
+    pages = 0
+    for offset in range(0, 1000, 100):
+        data = _ef_api_get(session, 'events', user, password,
+                           {'location': location_id, 'rows': 100, 'offset': offset})
+        rows = _ef_collection(data, 'event', 'events')
+        results.extend(rows)
+        pages += 1
+        total = _ef_total(data, 'events')
+        if not rows or len(rows) < 100 or (total is not None and offset + len(rows) >= total):
+            break
+    if not results:
+        raise ValueError('Eventfinda API responded but contained no events')
+    events = parse_eventfinda_api({'events': results}, src)
+    log.info('Eventfinda API: %d page(s), %d event records, %d valid Wellington dates',
+             pages, len(results), len(events))
+    if not events:
+        raise ValueError('Eventfinda API returned records but no usable upcoming Wellington dates')
+    return events
+
+
+def scrape_eventfinda_best(session, src):
+    """API when credentials are available, otherwise preserve HTML fallback."""
+    if os.environ.get('EVENTFINDA_USERNAME') and os.environ.get('EVENTFINDA_PASSWORD'):
+        return scrape_eventfinda_api(session, src)
+    return scrape_eventfinda(session, src)
+
+
 def scrape_eventfinda(session, src):
     """Parse public regional event cards/details; flag HTTP 403 instead of pretending success.
 
@@ -865,7 +1074,7 @@ def run_refresh(source_ids):
             elif src['id']=='hutt':ev=scrape_hutt(session,src)
             elif src['id']=='fringebar':ev=scrape_fringebar(session,src)
             elif src['id']=='humanitix':ev=scrape_humanitix(session,src)
-            elif src['id']=='eventfinda':ev=scrape_eventfinda(session,src)
+            elif src['id']=='eventfinda':ev=scrape_eventfinda_best(session,src)
             elif src['id']=='upper':ev=scrape_upper(session,src)
             elif src['id']=='natlib':ev=scrape_natlib(session,src)
             elif src['id']=='wcl':ev=scrape_wcl(session,src)

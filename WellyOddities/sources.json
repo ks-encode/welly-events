@@ -46,14 +46,14 @@
     "name": "Eventfinda",
     "url": "https://www.eventfinda.co.nz/whatson/events/wellington-region",
     "group": "General",
-    "description": "Broad regional event listings"
+    "description": "Official Eventfinda API when credentials are configured; otherwise public website fallback."
   },
   {
     "id": "humanitix",
     "name": "Humanitix",
     "url": "https://humanitix.com/nz/events/nz--wellington-region--wellington",
     "group": "Workshops",
-    "description": "Independent talks, classes and community events"
+    "description": "Wellington tickets, workshops and gatherings (marketplace plus event pages)"
   },
   {
     "id": "meetup",
@@ -128,9 +128,9 @@
   {
     "id": "wcl",
     "name": "Wellington City Libraries",
-    "url": "https://www.wcl.govt.nz/",
+    "url": "https://wellingtoncitylibraries.trumba.com/",
     "group": "Community",
-    "description": "Community workshops and free lectures"
+    "description": "Wellington public library events (Trumba calendar feed)"
   },
   {
     "id": "zealandia",
@@ -215,12 +215,5 @@
     "url": "https://www.eventfinda.co.nz/whatson/events/wellington-region/price/free",
     "group": "Community",
     "description": "Free local events"
-  },
-  {
-    "id": "facebook",
-    "name": "Facebook Events",
-    "url": "https://www.facebook.com/events/",
-    "group": "Social",
-    "description": "Informal gatherings; may require login"
   }
 ]

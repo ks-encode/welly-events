@@ -253,6 +253,69 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(events[0]['title'],'Brass Band Night')
         self.assertEqual(events[0]['date'],'2026-10-24')
 
+    def test_eventfinda_api_nested_response_and_location_safety(self):
+        src=next(x for x in server.SOURCES if x['id']=='eventfinda')
+        payload={'events':{'count':3,'event':[
+            {'id':1,'name':'Future Electronics Lecture',
+             'url':'https://www.eventfinda.co.nz/2026/future-electronics/wellington',
+             'datetime_start':'2026-11-02T18:30:00+13:00',
+             'location':{'name':'Te Papa','address':'Cable Street, Wellington'}},
+            {'id':2,'name':'Auckland Technology Show',
+             'url':'https://www.eventfinda.co.nz/2026/auckland-tech/auckland',
+             'datetime_start':'2026-11-03T12:00:00+13:00',
+             'location':{'name':'Auckland Centre','address':'Auckland'}},
+            {'id':3,'name':'Mystery Science Gathering',
+             'url':'https://www.eventfinda.co.nz/2026/mystery-science/wellington',
+             'datetime_start':'2026-11-05T09:00:00+13:00'}]}}
+        got=server.parse_eventfinda_api(payload,src)
+        self.assertEqual(len(got),2)
+        self.assertEqual(got[0]['date'],'2026-11-02')
+        self.assertEqual(got[0]['time'],'18:30')
+        self.assertEqual(got[1]['area'],'Wellington')
+        self.assertFalse(any('Auckland' in e['title'] for e in got))
+
+    def test_eventfinda_api_location_lookup_and_auth(self):
+        from unittest.mock import patch
+        src=next(x for x in server.SOURCES if x['id']=='eventfinda')
+        class ApiResponse:
+            def __init__(self,data):
+                self._data=data
+                self.content=b'{}'
+            def raise_for_status(self):pass
+            def json(self):return self._data
+        class ApiSession:
+            def __init__(self):self.calls=[]
+            def get(self,url,**kwargs):
+                self.calls.append((url,kwargs))
+                if url.endswith('locations.json'):
+                    return ApiResponse({'locations':{'location':[
+                        {'id':88,'name':'Wellington City','url_slug':'wellington-city'},
+                        {'id':77,'name':'Wellington Region','url_slug':'wellington-region'}], 'count':2}})
+                if url.endswith('events.json'):
+                    return ApiResponse({'events':{'event':[
+                        {'id':15,'name':'Microscope Workshop','datetime_start':'2026-11-04T11:00:00+13:00',
+                         'url':'https://www.eventfinda.co.nz/2026/microscope-workshop/wellington',
+                         'location':{'name':'Lower Hutt','address':'Lower Hutt'}}], 'count':1}})
+                raise AssertionError(url)
+        sess=ApiSession()
+        with patch.dict('os.environ',{'EVENTFINDA_USERNAME':'test-user','EVENTFINDA_PASSWORD':'test-password'},clear=False):
+            got=server.scrape_eventfinda_api(sess,src)
+        self.assertEqual(len(got),1)
+        self.assertEqual(got[0]['area'],'Lower Hutt')
+        self.assertEqual(sess.calls[-1][1]['params']['location'],'77')
+        self.assertEqual(sess.calls[-1][1]['auth'],('test-user','test-password'))
+        self.assertTrue(all('test-password' not in url for url,_ in sess.calls))
+
+    def test_eventfinda_api_multiple_sessions(self):
+        src=next(x for x in server.SOURCES if x['id']=='eventfinda')
+        payload={'events':[{'name':'Meteorite Exhibition',
+            'url':'https://www.eventfinda.co.nz/2026/meteorite-exhibition/wellington',
+            'location':{'name':'Museum Wellington','address':'Wellington'},
+            'sessions':{'session':[{'datetime_start':'2026-11-06T11:00:00+13:00'},
+                                   {'datetime_start':'2026-11-07T13:00:00+13:00'}]}}]}
+        got=server.parse_eventfinda_api(payload,src)
+        self.assertEqual([x['date'] for x in got], ['2026-11-06','2026-11-07'])
+
     def test_natlib_dated_card(self):
         s=next(x for x in server.SOURCES if x['id']=='natlib')
         html='<article><a href="/events/2026/10/24/poetry-slam">Wellington Regional Poetry Slam Finals</a></article>'
